@@ -82,6 +82,19 @@ def test_api_maintenance_ends_in_minutes(tmp_path, notifier, monkeypatch):
     service.close()
 
 
+def test_api_state_exposes_counts_health(tmp_path, notifier):
+    client, service = make_client(tmp_path, notifier)
+    with client:
+        client.post("/api/alarm/trigger")
+        state = client.get("/api/state").json()
+        assert state["counts_ok"] is True
+        assert state["rounds_limit"] == 100
+        assert state["total_rounds"] == 1
+        assert state["counts"]["pending"] == 1
+        assert len(state["rounds"]) == 1
+    service.close()
+
+
 def test_api_tick_and_observations_proxy(tmp_path, notifier):
     client, service = make_client(tmp_path, notifier)
     with client:

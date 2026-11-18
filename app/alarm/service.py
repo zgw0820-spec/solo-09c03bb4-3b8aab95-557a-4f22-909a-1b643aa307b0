@@ -32,6 +32,17 @@ GROUP_OF_STATE = {
     "cancelled": "cancelled",
 }
 
+ALL_STATES = tuple(GROUP_OF_STATE)
+COUNT_GROUPS = ("suppressed", "pending", "sent", "skipped", "cancelled")
+
+# The operator page shows only the newest rounds; counts come from a
+# maintained summary table, so polling never scans the full history.
+ROUNDS_PAGE_LIMIT = 100
+
+# After a failed counts rebuild, wait this long before trying again so a
+# broken summary table can never turn the 1s polling loop into a scan loop.
+COUNTS_REBUILD_BACKOFF_S = 5.0
+
 
 class AlarmConflict(Exception):
     """The requested operation conflicts with current alarm state."""
@@ -145,10 +156,17 @@ class AlarmService:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._worker_enabled = start_worker
+        # Monotonic timestamp until which counts rebuilds are quarantined
+        # (set only when a rebuild failed to restore consistency).
+        self._counts_quarantined_until = 0.0
 
         with self._lock:
             self._init_schema_locked()
             self._startup_recovery_locked()
+            # Authoritative recompute, once per process start: upgrades from
+            # older databases, restarts and any earlier maintenance failure
+            # all converge to statistics derived from the rounds table itself.
+            self._rebuild_counts_locked()
         if start_worker:
             self.start_worker()
 
@@ -161,6 +179,28 @@ class AlarmService:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA busy_timeout = 5000")
         try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    @contextmanager
+    def _db_snapshot(self) -> Iterator[sqlite3.Connection]:
+        """Read-only connection pinned to one committed snapshot (WAL).
+
+        Every query inside sees the same committed data, so the rounds list
+        and the counters served to the page always belong to one consistent
+        state — without taking the in-process delivery lock.
+        """
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        conn.isolation_level = None  # explicit BEGIN below pins the snapshot
+        try:
+            conn.execute("PRAGMA busy_timeout = 5000")
+            conn.execute("BEGIN")
             yield conn
             conn.commit()
         except Exception:
@@ -209,6 +249,129 @@ class AlarmService:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_alarm_rounds_state ON alarm_rounds(state)"
             )
+            # The per-poll "is there an unrecovered round?" lookup must stay
+            # O(1) no matter how much terminal history accumulates.
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_alarm_rounds_active
+                    ON alarm_rounds(id) WHERE recovered_at IS NULL
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_maintenance_windows_open
+                    ON maintenance_windows(id) WHERE closed_at IS NULL
+                """
+            )
+            self._ensure_counts_schema(conn)
+
+    @staticmethod
+    def _ensure_counts_schema(conn: sqlite3.Connection) -> None:
+        """Summary tables plus the triggers that maintain them.
+
+        The triggers fire inside the same transaction as every state change,
+        so counters can never be committed out of step with the rounds they
+        describe. Triggers are recreated so existing databases pick up exactly
+        this definition on their next start.
+        """
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS alarm_state_counts (
+                state TEXT PRIMARY KEY,
+                n INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS alarm_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO alarm_meta(key, value) VALUES ('total_rounds', '0')"
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO alarm_state_counts(state, n) VALUES (?, 0)",
+            [(state,) for state in ALL_STATES],
+        )
+        conn.execute("DROP TRIGGER IF EXISTS trg_alarm_rounds_count_insert")
+        conn.execute("DROP TRIGGER IF EXISTS trg_alarm_rounds_count_update")
+        conn.execute("DROP TRIGGER IF EXISTS trg_alarm_rounds_count_delete")
+        conn.execute(
+            """
+            CREATE TRIGGER trg_alarm_rounds_count_insert
+            AFTER INSERT ON alarm_rounds
+            BEGIN
+                INSERT INTO alarm_state_counts(state, n) VALUES (NEW.state, 1)
+                ON CONFLICT(state) DO UPDATE SET n = n + 1;
+                UPDATE alarm_meta
+                   SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+                 WHERE key = 'total_rounds';
+            END
+            """
+        )
+        conn.execute(
+            """
+            CREATE TRIGGER trg_alarm_rounds_count_update
+            AFTER UPDATE OF state ON alarm_rounds
+            WHEN OLD.state <> NEW.state
+            BEGIN
+                UPDATE alarm_state_counts SET n = n - 1 WHERE state = OLD.state;
+                INSERT INTO alarm_state_counts(state, n) VALUES (NEW.state, 1)
+                ON CONFLICT(state) DO UPDATE SET n = n + 1;
+            END
+            """
+        )
+        conn.execute(
+            """
+            CREATE TRIGGER trg_alarm_rounds_count_delete
+            AFTER DELETE ON alarm_rounds
+            BEGIN
+                UPDATE alarm_state_counts SET n = n - 1 WHERE state = OLD.state;
+                UPDATE alarm_meta
+                   SET value = CAST(CAST(value AS INTEGER) - 1 AS TEXT)
+                 WHERE key = 'total_rounds';
+            END
+            """
+        )
+
+    def _rebuild_counts_locked(self) -> None:
+        """Recompute the maintained statistics from the rounds table.
+
+        One full scan, but only at startup (upgrade / restart / previous
+        failure) or when a runtime consistency check trips — never on the
+        per-second polling path.
+        """
+        with self._db() as conn:
+            self._ensure_counts_schema(conn)  # self-heal a dropped summary table
+            conn.execute("DELETE FROM alarm_state_counts")
+            conn.execute(
+                """
+                INSERT INTO alarm_state_counts(state, n)
+                SELECT state, COUNT(*) AS n FROM alarm_rounds GROUP BY state
+                """
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO alarm_state_counts(state, n) VALUES (?, 0)",
+                [(state,) for state in ALL_STATES],
+            )
+            conn.execute(
+                """
+                UPDATE alarm_meta
+                   SET value = (SELECT CAST(COUNT(*) AS TEXT) FROM alarm_rounds)
+                 WHERE key = 'total_rounds'
+                """
+            )
+            row = conn.execute(
+                "SELECT value FROM alarm_meta WHERE key = 'total_rounds'"
+            ).fetchone()
+        logger.info(
+            "alarm state counts rebuilt from rounds table (total_rounds=%s)",
+            row["value"] if row is not None else "?",
+        )
 
     def _startup_recovery_locked(self) -> None:
         """A crash may leave rows in delivering: verify by number before re-sending."""
@@ -820,62 +983,146 @@ class AlarmService:
             "note": row["note"],
         }
 
+    @staticmethod
+    def _assemble_counts(
+        count_rows: list[sqlite3.Row] | None, total_row: sqlite3.Row | None
+    ) -> tuple[dict[str, int], int | None, bool]:
+        """Group raw per-state counters and check them against the total.
+
+        Both inputs must come from one snapshot. Anything off — unreadable or
+        missing rows, negative or non-integer counters, sum mismatch — marks
+        the statistics inconsistent so they are rebuilt or hidden, never
+        shown as if they were fine.
+        """
+        per_state: dict[str, int] = {}
+        clean = count_rows is not None
+        for row in count_rows or []:
+            try:
+                n = int(row["n"])
+            except (TypeError, ValueError):
+                clean = False
+                continue
+            if n < 0:
+                clean = False
+            per_state[str(row["state"])] = n
+        total: int | None = None
+        if total_row is not None:
+            try:
+                total = int(str(total_row["value"]))
+            except (TypeError, ValueError):
+                total = None
+        if total is None or total < 0 or sum(per_state.values()) != total:
+            clean = False
+        counts = {group: 0 for group in COUNT_GROUPS}
+        for state, n in per_state.items():
+            group = GROUP_OF_STATE.get(state)
+            if group is not None:
+                counts[group] += n
+        return counts, total, clean
+
+    def _read_counts(
+        self, conn: sqlite3.Connection
+    ) -> tuple[list[sqlite3.Row], sqlite3.Row | None]:
+        count_rows = conn.execute("SELECT state, n FROM alarm_state_counts").fetchall()
+        total_row = conn.execute(
+            "SELECT value FROM alarm_meta WHERE key = 'total_rounds'"
+        ).fetchone()
+        return count_rows, total_row
+
+    def _snapshot_rows(self, now: float) -> dict[str, Any]:
+        """All read-model rows from one committed snapshot (no app lock held)."""
+        with self._db_snapshot() as conn:
+            rounds = conn.execute(
+                "SELECT * FROM alarm_rounds ORDER BY id DESC LIMIT ?",
+                (ROUNDS_PAGE_LIMIT,),
+            ).fetchall()
+            active = conn.execute(
+                """
+                SELECT * FROM alarm_rounds
+                 WHERE recovered_at IS NULL
+                 ORDER BY id DESC LIMIT 1
+                """
+            ).fetchone()
+            active_window = conn.execute(
+                """
+                SELECT * FROM maintenance_windows
+                 WHERE closed_at IS NULL AND ends_at > ?
+                 ORDER BY id DESC LIMIT 1
+                """,
+                (now,),
+            ).fetchone()
+            latest_window = conn.execute(
+                "SELECT * FROM maintenance_windows ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            try:
+                count_rows, total_row = self._read_counts(conn)
+            except sqlite3.Error:
+                # A broken summary must not take the rest of the page down.
+                logger.exception("reading maintained alarm counts failed")
+                count_rows, total_row = None, None
+        return {
+            "rounds": rounds,
+            "active": active,
+            "active_window": active_window,
+            "latest_window": latest_window,
+            "count_rows": count_rows,
+            "total_row": total_row,
+        }
+
     def get_state(self) -> dict[str, Any]:
         now = self._clock()
-        with self._lock:
-            self._expire_windows_locked(now)
-            with self._db() as conn:
-                rounds = conn.execute(
-                    "SELECT * FROM alarm_rounds ORDER BY id DESC LIMIT 100"
-                ).fetchall()
-                active = conn.execute(
-                    "SELECT * FROM alarm_rounds WHERE recovered_at IS NULL ORDER BY id DESC LIMIT 1"
-                ).fetchone()
-                active_window = conn.execute(
-                    """
-                    SELECT * FROM maintenance_windows
-                     WHERE closed_at IS NULL AND ends_at > ?
-                     ORDER BY id DESC LIMIT 1
-                    """,
-                    (now,),
-                ).fetchone()
-                latest_window = conn.execute(
-                    "SELECT * FROM maintenance_windows ORDER BY id DESC LIMIT 1"
-                ).fetchone()
-                grouped = conn.execute(
-                    """
-                    SELECT state, COUNT(*) AS n FROM alarm_rounds GROUP BY state
-                    """
-                ).fetchall()
-                totals = conn.execute(
-                    "SELECT COUNT(*) AS total FROM alarm_rounds"
-                ).fetchone()
-            counts = {
-                "suppressed": 0,
-                "pending": 0,
-                "sent": 0,
-                "skipped": 0,
-                "cancelled": 0,
-            }
-            for item in grouped:
-                group = GROUP_OF_STATE.get(str(item["state"]))
-                if group is not None:
-                    counts[group] += int(item["n"])
-            return {
-                "device": DEVICE_NAME,
-                "now": iso_z(now),
-                "maintenance": self._maintenance_dict(active_window, now)
-                if active_window is not None
-                else None,
-                "latest_maintenance": self._maintenance_dict(latest_window, now)
-                if latest_window is not None
-                else None,
-                "active_round": self._round_dict(active) if active is not None else None,
-                "rounds": [self._round_dict(row) for row in rounds],
-                "counts": counts,
-                "total_rounds": int(totals["total"]) if totals is not None else 0,
-                "worker_running": self.worker_running,
-            }
+        # Indexed upkeep only; skipped entirely while a writer holds the lock —
+        # the worker expires windows on every tick anyway and the next poll
+        # retries. The per-second poll therefore never queues behind delivery
+        # writes, and never holds the lock itself.
+        if self._lock.acquire(blocking=False):
+            try:
+                self._expire_windows_locked(now)
+            finally:
+                self._lock.release()
+        # Lock-free reads on one committed snapshot (WAL): the rounds list and
+        # the counters below always belong to the same committed state.
+        snap = self._snapshot_rows(now)
+        counts, total, consistent = self._assemble_counts(
+            snap["count_rows"], snap["total_row"]
+        )
+        if not consistent and time.monotonic() >= self._counts_quarantined_until:
+            logger.warning("alarm state counts inconsistent; rebuilding from rounds table")
+            try:
+                with self._lock:
+                    self._rebuild_counts_locked()
+            except sqlite3.Error:
+                logger.exception("rebuilding alarm state counts failed")
+            # Re-read everything so list and counters still share one snapshot.
+            snap = self._snapshot_rows(now)
+            counts, total, consistent = self._assemble_counts(
+                snap["count_rows"], snap["total_row"]
+            )
+            if not consistent:
+                # Neither retry every second nor show plausible-but-wrong
+                # numbers in the meantime.
+                self._counts_quarantined_until = time.monotonic() + COUNTS_REBUILD_BACKOFF_S
+                logger.error("alarm state counts unavailable; hiding statistics")
+        active = snap["active"]
+        active_window = snap["active_window"]
+        latest_window = snap["latest_window"]
+        return {
+            "device": DEVICE_NAME,
+            "now": iso_z(now),
+            "maintenance": self._maintenance_dict(active_window, now)
+            if active_window is not None
+            else None,
+            "latest_maintenance": self._maintenance_dict(latest_window, now)
+            if latest_window is not None
+            else None,
+            "active_round": self._round_dict(active) if active is not None else None,
+            "rounds": [self._round_dict(row) for row in snap["rounds"]],
+            "rounds_limit": ROUNDS_PAGE_LIMIT,
+            "counts": counts if consistent else None,
+            "counts_ok": consistent,
+            "total_rounds": total if consistent else None,
+            "worker_running": self.worker_running,
+        }
 
     def close(self) -> None:
         self.stop_worker()

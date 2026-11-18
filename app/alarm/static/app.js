@@ -107,11 +107,28 @@ function render(state) {
   $("#recover").disabled = busy || !active;
   $("#set-maint").disabled = busy;
 
-  const c = state.counts;
-  const values = [c.suppressed, c.pending, c.sent, c.skipped, c.cancelled];
-  document.querySelectorAll("#stats .stat .n").forEach((el, idx) => {
-    el.textContent = values[idx];
-  });
+  const statEls = document.querySelectorAll("#stats .stat .n");
+  const statsWarn = $("#stats-warning");
+  if (state.counts_ok === false || !state.counts) {
+    // 后端校验未通过：宁可显示不可用，也不展示貌似正常的错误统计。
+    statEls.forEach((el) => { el.textContent = "–"; });
+    statsWarn.classList.remove("hidden");
+  } else {
+    const c = state.counts;
+    const values = [c.suppressed, c.pending, c.sent, c.skipped, c.cancelled];
+    statEls.forEach((el, idx) => { el.textContent = values[idx]; });
+    statsWarn.classList.add("hidden");
+  }
+
+  const totalEl = $("#rounds-total");
+  if (typeof state.total_rounds === "number") {
+    const limit = state.rounds_limit || 100;
+    totalEl.textContent = state.total_rounds > limit
+      ? `共 ${state.total_rounds} 轮 · 仅显示最近 ${state.rounds.length} 轮`
+      : `共 ${state.total_rounds} 轮`;
+  } else {
+    totalEl.textContent = "";
+  }
 
   const tbody = $("#rounds tbody");
   tbody.innerHTML = "";

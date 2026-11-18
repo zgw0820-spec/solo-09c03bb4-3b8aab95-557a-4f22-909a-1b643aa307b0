@@ -59,10 +59,12 @@
     <div class="stat skipped"><span class="n">0</span><span class="t">未补送</span></div>
     <div class="stat cancelled"><span class="n">0</span><span class="t">已取消</span></div>
   </section>
+  <div id="stats-warning" class="stats-warning hidden">统计校验未通过，正在后台重建；为避免误展示，计数暂不可用。</div>
 
   <section class="card table-card">
     <div class="card-head">
       <h2>告警轮次</h2>
+      <span class="muted" id="rounds-total"></span>
       <span class="muted">每轮固定通知号 · 回执丢失先按号核实 · 不重复通知</span>
     </div>
     <div class="table-wrap">
